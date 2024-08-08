@@ -19,7 +19,7 @@ const CNT: usize = 5000;
 
 #[entry]
 fn main() -> ! {
-    init_logger(log::LevelFilter::Off);
+    init_logger(LevelFilter::Off);
 
     let peripherals = Peripherals::take();
     let system = peripherals.SYSTEM.split();

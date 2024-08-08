@@ -1,6 +1,8 @@
 #[cfg(not(feature = "crypto"))]
 use core::marker::PhantomData;
 
+use crate::trace;
+
 use core::cell::RefCell;
 
 use critical_section::Mutex;
@@ -16,14 +18,14 @@ use crate::{
     att::Uuid,
     attribute::Attribute,
     attribute_server::{AttributeServerError, NotificationData, WorkResult},
-    Addr,
+    types::Addr,
 };
 
 pub struct AttributeServer<'a, T, R: CryptoRng + RngCore>
 where
     T: embedded_io_async::Read + embedded_io_async::Write,
 {
-    pub(crate) ble: &'a mut Ble<T>,
+    pub ble: &'a mut Ble<T>,
     pub(crate) src_handle: u16,
     pub(crate) mtu: u16,
     pub(crate) attributes: &'a mut [Attribute<'a>],
@@ -80,7 +82,7 @@ where
             }
         }
 
-        log::trace!("{:#x?}", &attributes);
+        trace!("{:#x?}", &attributes);
 
         #[cfg(feature = "crypto")]
         let mut security_manager = AsyncSecurityManager::new(_rng);

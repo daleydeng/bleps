@@ -1,12 +1,6 @@
-#[cfg(not(feature = "crypto"))]
-use core::marker::PhantomData;
-
-use rand_core::{CryptoRng, RngCore};
-
-#[cfg(feature = "crypto")]
-use crate::sm::SecurityManager;
+use crate::types::{ACLBoundaryFlag, ACLBroadcastFlag, ACLDataPacket, HCIPacket};
+use crate::{trace, debug};
 use crate::{
-    acl::{AclPacket, BoundaryFlag, HostBroadcastFlag},
     att::{
         Att, AttDecodeError, AttErrorCode, Uuid, ATT_FIND_BY_TYPE_VALUE_REQUEST_OPCODE,
         ATT_FIND_INFORMATION_REQ_OPCODE, ATT_PREPARE_WRITE_REQ_OPCODE, ATT_READ_BLOB_REQ_OPCODE,
@@ -15,9 +9,10 @@ use crate::{
     },
     attribute::Attribute,
     command::{Command, LE_OGF, SET_ADVERTISING_DATA_OCF},
-    event::EventType,
     l2cap::{L2capDecodeError, L2capPacket},
-    Addr, Ble, Data, Error,
+    types::{EventPacket, LEEventPacket},
+    Ble, Data, Error,
+    Read, Write
 };
 
 pub const PRIMARY_SERVICE_UUID16: Uuid = Uuid::Uuid16(0x2800);
@@ -62,32 +57,27 @@ impl From<AttDecodeError> for AttributeServerError {
     }
 }
 
-pub struct AttributeServer<'a, R: CryptoRng + RngCore> {
-    ble: &'a mut Ble<'a>,
+pub struct AttributeServer<'a, T, F> {
+    pub ble: &'a mut Ble<T, F>,
     // The MTU negotiated for this server. In principle this can be different per-client,
     // but we only support one client at a time, so we only need to store one value
     // (and reset it to the default when disconnecting).
     mtu: u16,
     src_handle: u16,
     attributes: &'a mut [Attribute<'a>],
-
-    #[cfg(feature = "crypto")]
-    security_manager: SecurityManager<'a, Ble<'a>, R>,
-
-    #[cfg(feature = "crypto")]
-    pub(crate) pin_callback: Option<&'a mut dyn FnMut(u32)>,
-
-    #[cfg(not(feature = "crypto"))]
-    phantom: PhantomData<R>,
 }
 
 // Using the bleps-dedup proc-macro to de-duplicate the async/sync code
 // The macro will remove async/await for the SYNC implementation
 bleps_dedup::dedup! {
-    impl<'a, R: CryptoRng + RngCore> SYNC AttributeServer<'a, R>
-    impl<'a, T, R: CryptoRng + RngCore> ASYNC crate::async_attribute_server::AttributeServer<'a, T, R>
+    impl<'a, T, F> SYNC AttributeServer<'a, T, F>
         where
-            T: embedded_io_async::Read + embedded_io_async::Write,
+            T: Read + Write,
+            F: Fn()->u64,
+    impl<'a, T, F> ASYNC crate::async_attribute_server::AttributeServer<'a, T, R>
+        where
+            T: Read + Write,
+            F: Fn()->u64,
     {
         pub fn get_characteristic_value(
             &mut self,
@@ -104,17 +94,17 @@ bleps_dedup::dedup! {
             }
         }
 
-        pub async fn update_le_advertising_data(&mut self, data: Data) -> Result<EventType, Error> {
+        pub async fn update_le_advertising_data(&mut self, data: Data) -> Result<EventPacket, Error> {
             self.ble
                 .write_bytes(Command::LeSetAdvertisingData { data }.encode().as_slice())
                 .await;
             self.ble
                 .wait_for_command_complete(LE_OGF, SET_ADVERTISING_DATA_OCF)
                 .await?
-                .check_command_completed()
+                .check_cmd_completed()
         }
 
-        pub async fn disconnect(&mut self, reason: u8) -> Result<EventType, Error> {
+        pub async fn disconnect(&mut self, reason: u8) -> Result<EventPacket, Error> {
             self.ble
                 .write_bytes(
                     Command::Disconnect {
@@ -125,7 +115,7 @@ bleps_dedup::dedup! {
                     .as_slice(),
                 )
                 .await;
-            Ok(EventType::Unknown)
+            Ok(EventPacket::Unknown)
         }
 
         pub async fn do_work(&mut self) -> Result<WorkResult, AttributeServerError> {
@@ -147,67 +137,46 @@ bleps_dedup::dedup! {
             let packet = self.ble.poll().await;
 
             if packet.is_some() {
-                log::trace!("polled: {:?}", packet);
+                trace!("polled: {:?}", packet);
             }
 
             match packet {
                 None => Ok(WorkResult::DidWork),
                 Some(packet) => match packet {
-                    crate::PollResult::Event(EventType::DisconnectComplete {
-                        handle: _,
-                        status: _,
-                        reason: _,
+                    crate::PollResult::Event(EventPacket::DisconnectionComplete {
+                        ..
                     }) => {
                             // Reset the MTU; the next connection will need to renegotiate it.
                             self.mtu = BASE_MTU;
                             Ok(WorkResult::GotDisconnected)
                     }
-                    crate::PollResult::Event(EventType::ConnectionComplete {
-                        status: _status,
-                        handle: _,
-                        role: _,
-                        peer_address: _peer_address,
-                        interval: _,
-                        latency: _,
-                        timeout: _,
+                    crate::PollResult::Event(EventPacket::LEMeta {
+                        packet: LEEventPacket::ConnectionComplete {
+                            status: _status,
+                            peer_address: _peer_address,
+                            ..
+                        },
+                        ..
                     }) => {
-                        #[cfg(feature = "crypto")]
-                        if _status == 0 {
-                            self.security_manager.peer_address = Some(_peer_address);
-                        }
                         Ok(WorkResult::DidWork)
                     }
-                    crate::PollResult::Event(EventType::LongTermKeyRequest {
-                        handle: _handle,
-                        random: _,
-                        diversifier: _,
+                    crate::PollResult::Event(EventPacket::LEMeta {
+                        packet: LEEventPacket::LongTermKeyRequest {
+                            connection_handle: _handle,
+                            ..
+                        },
+                        ..
                     }) => {
-                        #[cfg(feature = "crypto")]
-                        {
-                            if let Some(ltk) =  self.security_manager.ltk {
-                                self.ble
-                                .cmd_long_term_key_request_reply(
-                                    _handle,
-                                    ltk,
-                                ).await.unwrap();
-                            } else {
-                                // TODO handle this via long term key request negative reply
-                            }
-                        }
                         Ok(WorkResult::DidWork)
                     }
                     crate::PollResult::Event(_) => Ok(WorkResult::DidWork),
                     crate::PollResult::AsyncData(packet) => {
                         let (src_handle, l2cap_packet) = L2capPacket::decode(packet)?;
                         if l2cap_packet.channel == 6 {
-                            // handle SM
-                            #[cfg(feature = "crypto")]
-                            self.security_manager
-                                .handle(self.ble, src_handle, l2cap_packet.payload, &mut self.pin_callback).await?;
                             Ok(WorkResult::DidWork)
                         } else {
                         let packet = Att::decode(l2cap_packet)?;
-                        log::trace!("att: {:x?}", packet);
+                        trace!("att: {:x?}", packet);
                         match packet {
                             Att::ReadByGroupTypeReq {
                                 start,
@@ -307,9 +276,9 @@ bleps_dedup::dedup! {
             let mut data = Data::new_att_read_by_group_type_response();
             let mut val = Err(AttErrorCode::AttributeNotFound);
             for att in self.attributes.iter_mut() {
-                log::trace!("Check attribute {:x?} {}", att.uuid, att.handle);
+                trace!("Check attribute {:x?} {}", att.uuid, att.handle);
                 if att.uuid == group_type && att.handle >= start && att.handle <= end {
-                    log::debug!("found! {:x?}", att.handle);
+                    debug!("found! {:x?}", att.handle);
                     handle = att.handle;
                     val = att.value();
                     if let Ok(val) = val {
@@ -344,7 +313,7 @@ bleps_dedup::dedup! {
             let mut data = Data::new_att_read_by_type_response();
             let mut err = Err(AttErrorCode::AttributeNotFound);
             for att in self.attributes.iter_mut() {
-                log::trace!("Check attribute {:x?} {}", att.uuid, att.handle);
+                trace!("Check attribute {:x?} {}", att.uuid, att.handle);
                 if att.uuid == attribute_type && att.handle >= start && att.handle <= end {
                     data.append_value(att.handle);
                     handle = att.handle;
@@ -357,7 +326,7 @@ bleps_dedup::dedup! {
                         }
                     }
 
-                    log::debug!("found! {:x?} {}", att.uuid, att.handle);
+                    debug!("found! {:x?} {}", att.uuid, att.handle);
                     break;
                 }
             }
@@ -406,7 +375,7 @@ bleps_dedup::dedup! {
 
             let err = att.data.write(0, data.as_slice());
             if let Err(e) = err {
-                log::debug!("write error: {e:?}");
+                debug!("write error: {e:?}");
                 return Err(e);
             }
 
@@ -439,7 +408,7 @@ bleps_dedup::dedup! {
 
         async fn handle_exchange_mtu(&mut self, src_handle: u16, mtu: u16) {
             self.mtu = mtu.min(MTU);
-            log::debug!("Requested MTU {mtu}, returning {}", self.mtu);
+            debug!("Requested MTU {mtu}, returning {}", self.mtu);
             self.write_att(src_handle, Data::new_att_exchange_mtu_response(self.mtu))
                 .await;
         }
@@ -470,12 +439,12 @@ bleps_dedup::dedup! {
             let mut data = Data::new_att_find_information_response();
 
             for att in self.attributes.iter_mut() {
-                log::trace!("Check attribute {:x?} {}", att.uuid, att.handle);
+                trace!("Check attribute {:x?} {}", att.uuid, att.handle);
                 if att.handle >= start && att.handle <= end {
                     if !data.append_att_find_information_response(att.handle, &att.uuid) {
                         break;
                     }
-                    log::debug!("found! {:x?} {}", att.uuid, att.handle);
+                    debug!("found! {:x?} {}", att.uuid, att.handle);
                 }
             }
 
@@ -484,7 +453,7 @@ bleps_dedup::dedup! {
                 return;
             }
 
-            log::debug!("not found");
+            debug!("not found");
 
             // respond with error
             self.write_att(
@@ -560,50 +529,33 @@ bleps_dedup::dedup! {
         }
 
         async fn write_att(&mut self, handle: u16, data: Data) {
-            log::debug!("src_handle {}", handle);
-            log::debug!("data {:x?}", data.as_slice());
+            debug!("src_handle {}", handle);
+            debug!("data {:x?}", data.as_slice());
 
             let res = L2capPacket::encode(data);
-            log::trace!("encoded_l2cap {:x?}", res.as_slice());
+            trace!("encoded_l2cap {:x?}", res.as_slice());
 
-            let res = AclPacket::encode(
+            let pkt = ACLDataPacket::new(
                 handle,
-                BoundaryFlag::FirstAutoFlushable,
-                HostBroadcastFlag::NoBroadcast,
-                res,
+                ACLBoundaryFlag::FirstAutoFlushable,
+                ACLBroadcastFlag::PointToPoint,
+                res.as_slice()
             );
-            log::trace!("writing {:x?}", res.as_slice());
-            self.ble.write_bytes(res.as_slice()).await;
+
+            let pkt = HCIPacket::ACLData(pkt);
+            let buffer = pkt.encode();
+            trace!("writing {:x?}", buffer.as_slice());
+            self.ble.write_bytes(&buffer).await;
         }
     }
 }
 
-impl<'a, R: CryptoRng + RngCore> AttributeServer<'a, R> {
-    /// Create a new instance of the AttributeServer
-    ///
-    /// When _NOT_ using the `crypto` feature you can pass a mutual reference to `bleps::no_rng::NoRng`
-    pub fn new(
-        ble: &'a mut Ble<'a>,
-        attributes: &'a mut [Attribute<'a>],
-        rng: &'a mut R,
-    ) -> AttributeServer<'a, R> {
-        AttributeServer::new_with_ltk(
-            ble,
-            attributes,
-            Addr::from_le_bytes(false, [0u8; 6]),
-            None,
-            rng,
-        )
-    }
-
+impl<'a, T, F> AttributeServer<'a, T, F> {
     /// Create a new instance, optionally provide an LTK
-    pub fn new_with_ltk(
-        ble: &'a mut Ble<'a>,
+    pub fn new(
+        ble: &'a mut Ble<T, F>,
         attributes: &'a mut [Attribute<'a>],
-        _local_addr: Addr,
-        _ltk: Option<u128>,
-        _rng: &'a mut R,
-    ) -> AttributeServer<'a, R> {
+    ) -> Self {
         for (i, attr) in attributes.iter_mut().enumerate() {
             attr.handle = i as u16 + 1;
         }
@@ -617,45 +569,16 @@ impl<'a, R: CryptoRng + RngCore> AttributeServer<'a, R> {
             }
         }
 
-        log::trace!("{:#x?}", &attributes);
-
-        #[cfg(feature = "crypto")]
-        let mut security_manager = SecurityManager::new(_rng);
-        #[cfg(feature = "crypto")]
-        {
-            security_manager.local_address = Some(_local_addr);
-            security_manager.ltk = _ltk;
-        }
+        trace!("{:#x?}", &attributes);
 
         AttributeServer {
             ble,
             mtu: BASE_MTU,
             src_handle: 0,
             attributes,
-
-            #[cfg(feature = "crypto")]
-            security_manager,
-            #[cfg(feature = "crypto")]
-            pin_callback: None,
-
-            #[cfg(not(feature = "crypto"))]
-            phantom: PhantomData::default(),
         }
     }
 
-    /// Get the current LTK
-    pub fn get_ltk(&self) -> Option<u128> {
-        #[cfg(feature = "crypto")]
-        return self.security_manager.ltk;
-
-        #[cfg(not(feature = "crypto"))]
-        None
-    }
-
-    #[cfg(feature = "crypto")]
-    pub fn set_pin_callback(&mut self, pin_callback: Option<&'a mut dyn FnMut(u32)>) {
-        self.pin_callback = pin_callback;
-    }
 }
 
 #[derive(Debug)]
