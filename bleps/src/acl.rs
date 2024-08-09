@@ -1,5 +1,6 @@
 use binrw::io::Cursor;
 use binrw::{BinRead, BinWrite};
+use maybe_async::maybe_async;
 
 use crate::Read;
 use crate::types::{ACLBoundaryFlag, ACLBroadcastFlag, ACLDataPacket, ACLDataPacketHeader, ACLPacketBuffer, ACLPayloadBuffer, ACL_PKT_HEADER_SIZE, ACL_PKT_MAX_SIZE};
@@ -24,8 +25,8 @@ impl ACLDataPacket {
         ACLPacketBuffer::from_slice(&buf[..len]).unwrap()
     }
 
-    #[maybe_async::maybe_async]
-    pub fn read<T: Read>(connector: &mut T) -> Self {
+    #[maybe_async]
+    pub async fn read<T: Read>(connector: &mut T) -> Self {
         let mut buffer = [0u8; ACL_PKT_MAX_SIZE];
         let l = connector.read(&mut buffer[..4]).await.unwrap();
         assert_eq!(l, ACL_PKT_HEADER_SIZE);
