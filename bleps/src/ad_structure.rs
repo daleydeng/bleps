@@ -104,22 +104,8 @@ impl Data {
 
 pub fn create_advertising_data(ad: &[AdStructure]) -> Result<Data, AdvertisementDataError> {
     let mut data = Data::default();
-    data.append(&[0]);
-
     for item in ad.iter() {
         data.append_ad_structure(&item);
     }
-
-    let len = data.len - 1;
-    data.set(0, len as u8);
-
-    if len > 31 {
-        return Err(AdvertisementDataError::TooLong);
-    }
-
-    for _ in 0..(31 - len) {
-        data.append(&[0]);
-    }
-
     Ok(data)
 }

@@ -1,12 +1,25 @@
 #![no_std]
 
-use log::*;
+#[macro_use]
+extern crate alloc;
+
+use heapless::{Vec, String};
+
+#[cfg(not(feature = "defmt"))]
+use log::{debug, trace};
+#[cfg(feature = "defmt")]
+use defmt::{panic, debug, trace};
+
+#[cfg(all(feature = "log", feature = "defmt"))]
+compile_error!("log and defmt can't have both!");
+
 use maybe_async::maybe_async;
-use types::ACLDataPacket;
+use thiserror_no_std::Error;
+use types::{encode, ACLDataPacket, AdvertisingFilterPolicy, AdvertisingParameters, AdvertisingType, CommandPacket, ControllerError, HCIPacket, OwnAddressType, PeerAddressType, CMD_LE_ADV_DATA_MAX_SIZE};
 use core::cell::RefCell;
 
 use command::{
-    opcode, Command, INFORMATIONAL_OGF, LONG_TERM_KEY_REQUEST_REPLY_OCF, READ_BD_ADDR_OCF,
+    opcode, INFORMATIONAL_OGF, LONG_TERM_KEY_REQUEST_REPLY_OCF, READ_BD_ADDR_OCF,
     SET_ADVERTISE_ENABLE_OCF, SET_ADVERTISING_DATA_OCF, SET_EVENT_MASK_OCF, SET_SCAN_RSP_DATA_OCF,
 };
 use command::{CONTROLLER_OGF, LE_OGF, RESET_OCF, SET_ADVERTISING_PARAMETERS_OCF};
@@ -40,80 +53,22 @@ compile_error!("sync and async are conflict!, choose one");
 
 const TIMEOUT_MILLIS: u64 = 1000;
 
-#[derive(Debug)]
-pub enum Error {
+#[derive(Error, Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum BleError {
+    #[error("Timeout")]
     Timeout,
-    Failed(u8),
-}
-
-#[cfg(feature = "defmt")]
-impl defmt::Format for Error {
-    fn format(&self, fmt: defmt::Formatter) {
-        match self {
-            Error::Timeout => {
-                defmt::write!(fmt, "Timeout")
-            }
-            Error::Failed(value) => {
-                defmt::write!(fmt, "Failed({})", value)
-            }
-        }
-    }
+    #[error("Controller Error: {}", .0)]
+    CtrlErr(#[from] ControllerError),
+    #[error("Unknown Error")]
+    Unknown(String<64>),
 }
 
 #[derive(Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum PollResult {
     Event(EventPacket),
     AsyncData(ACLDataPacket),
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum AdvertisingType {
-    AdvInd = 0x00,
-    AdvDirectInd = 0x01,
-    AdvScanInd = 0x02,
-    AdvNonConnInd = 0x03,
-    AdvDirectIndLowDuty = 0x04,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum OwnAddressType {
-    Public = 0x00,
-    Random = 0x01,
-    ResolvablePrivateAddress = 0x02,
-    ResolvablePrivateAddressFromIRK = 0x03,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum PeerAddressType {
-    Public = 0x00,
-    Random = 0x01,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum AdvertisingChannelMapBits {
-    Channel37 = 0b001,
-    Channel38 = 0b010,
-    Channel39 = 0b100,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum AdvertisingFilterPolicy {
-    All = 0x00,
-    FilteredScanAllConnect = 0x01,
-    AllScanFilteredConnect = 0x02,
-    Filtered = 0x03,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct AdvertisingParameters {
-    pub advertising_interval_min: u16,
-    pub advertising_interval_max: u16,
-    pub advertising_type: AdvertisingType,
-    pub own_address_type: OwnAddressType,
-    pub peer_address_type: PeerAddressType,
-    pub peer_address: [u8; 6],
-    pub advertising_channel_map: u8,
-    pub filter_policy: AdvertisingFilterPolicy,
 }
 
 const PACKET_TYPE_COMMAND: u8 = 0x01;
@@ -147,116 +102,123 @@ impl<T, F> Ble<T, F>
 where T: Read + Write,
         F: Fn()->u64
 {
-    pub async fn init(&mut self) -> Result<(), Error>
+    pub async fn init(&mut self) -> Result<(), BleError>
     where
         Self: Sized,
     {
         self.cmd_reset().await?;
-        self.cmd_set_event_mask([0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]).await?;
+        self.cmd_set_event_mask(0xffff_ffff_ffff_ffffu64).await?;
         Ok(())
     }
 
-    pub async fn cmd_reset(&mut self) -> Result<EventPacket, Error>
+    pub async fn cmd_reset(&mut self) -> Result<EventPacket, BleError>
     where
         Self: Sized,
     {
-        self.write_bytes(Command::Reset.encode().as_slice()).await;
-        self.wait_for_command_complete(CONTROLLER_OGF, RESET_OCF).await?
-            .check_cmd_completed()
+        let cmd = HCIPacket::Command(CommandPacket::Reset{});
+        self.write_bytes(cmd.encode().as_slice()).await;
+        self.wait_for_command_complete(CONTROLLER_OGF, RESET_OCF).await
     }
 
-    pub async fn cmd_set_event_mask(&mut self, events: [u8; 8]) -> Result<EventPacket, Error>
+    pub async fn cmd_set_event_mask(&mut self, event_mask: u64) -> Result<EventPacket, BleError>
     where
         Self: Sized,
     {
-        self.write_bytes(Command::SetEventMask { events }.encode().as_slice()).await;
-        self.wait_for_command_complete(CONTROLLER_OGF, SET_EVENT_MASK_OCF).await?
-            .check_cmd_completed()
+        let cmd = HCIPacket::Command(CommandPacket::SetEventMask { event_mask });
+        self.write_bytes(cmd.encode().as_slice()).await;
+        self.wait_for_command_complete(CONTROLLER_OGF, SET_EVENT_MASK_OCF).await
     }
 
-    pub async fn cmd_set_le_advertising_parameters(&mut self) -> Result<EventPacket, Error>
+    pub async fn cmd_set_le_advertising_parameters(&mut self) -> Result<EventPacket, BleError>
     where
         Self: Sized,
     {
-        self.write_bytes(Command::LeSetAdvertisingParameters.encode().as_slice()).await;
-        self.wait_for_command_complete(LE_OGF, SET_ADVERTISING_PARAMETERS_OCF).await?
-            .check_cmd_completed()
+        let params = AdvertisingParameters::default();
+        let cmd = HCIPacket::Command(CommandPacket::LeSetAdvertisingParameters {
+            params
+        });
+        self.write_bytes(cmd.encode().as_slice()).await;
+        self.wait_for_command_complete(LE_OGF, SET_ADVERTISING_PARAMETERS_OCF).await
     }
 
     pub async fn cmd_set_le_advertising_parameters_custom(
         &mut self,
         params: &AdvertisingParameters,
-    ) -> Result<EventPacket, Error>
+    ) -> Result<EventPacket, BleError>
     where
         Self: Sized,
     {
-        self.write_bytes(
-            Command::LeSetAdvertisingParametersCustom(params)
-                .encode()
-                .as_slice(),
-        ).await;
-        self.wait_for_command_complete(LE_OGF, SET_ADVERTISING_PARAMETERS_OCF).await?
-            .check_cmd_completed()
+        let cmd = HCIPacket::Command(CommandPacket::LeSetAdvertisingParameters {
+            params: *params,
+        });
+        self.write_bytes(cmd.encode().as_slice()).await;
+        self.wait_for_command_complete(LE_OGF, SET_ADVERTISING_PARAMETERS_OCF).await
     }
 
-    pub async fn cmd_set_le_advertising_data(&mut self, data: Data) -> Result<EventPacket, Error>
+    pub async fn cmd_set_le_advertising_data(&mut self, data: Data) -> Result<EventPacket, BleError>
     where
         Self: Sized,
     {
-        self.write_bytes(Command::LeSetAdvertisingData { data }.encode().as_slice()).await;
-        self.wait_for_command_complete(LE_OGF, SET_ADVERTISING_DATA_OCF).await?
-            .check_cmd_completed()
+        let data = Vec::from_slice(data.as_slice()).expect(
+            &format!("data size({}) > limit({})", data.len(), CMD_LE_ADV_DATA_MAX_SIZE));
+        let cmd = HCIPacket::Command(CommandPacket::LeSetAdvertisingData {
+            data
+        });
+        self.write_bytes(cmd.encode().as_slice()).await;
+        self.wait_for_command_complete(LE_OGF, SET_ADVERTISING_DATA_OCF).await
     }
 
-    pub async fn cmd_set_le_scan_rsp_data(&mut self, data: Data) -> Result<EventPacket, Error>
+    pub async fn cmd_set_le_scan_rsp_data(&mut self, data: Data) -> Result<EventPacket, BleError>
     where
         Self: Sized,
     {
-        self.write_bytes(Command::LeSetScanRspData { data }.encode().as_slice()).await;
-        self.wait_for_command_complete(LE_OGF, SET_SCAN_RSP_DATA_OCF).await?
-            .check_cmd_completed()
+        let cmd = HCIPacket::Command(CommandPacket::LeSetScanRspData {
+            data: Vec::from_slice(data.as_slice()).unwrap(),
+        });
+        self.write_bytes(cmd.encode().as_slice()).await;
+        self.wait_for_command_complete(LE_OGF, SET_SCAN_RSP_DATA_OCF).await
     }
 
-    pub async fn cmd_set_le_advertise_enable(&mut self, enable: bool) -> Result<EventPacket, Error>
+    pub async fn cmd_set_le_advertise_enable(&mut self, enable: bool) -> Result<EventPacket, BleError>
     where
         Self: Sized,
     {
-        self.write_bytes(Command::LeSetAdvertiseEnable(enable).encode().as_slice()).await;
-        self.wait_for_command_complete(LE_OGF, SET_ADVERTISE_ENABLE_OCF).await?
-            .check_cmd_completed()
+        let cmd = HCIPacket::Command(CommandPacket::LeSetAdvertiseEnable { enable });
+        self.write_bytes(cmd.encode().as_slice()).await;
+        self.wait_for_command_complete(LE_OGF, SET_ADVERTISE_ENABLE_OCF).await
     }
 
     pub async fn cmd_long_term_key_request_reply(
         &mut self,
         handle: u16,
         ltk: u128,
-    ) -> Result<EventPacket, Error>
+    ) -> Result<EventPacket, BleError>
     where
         Self: Sized,
     {
         trace!("before, key = {:x}, hanlde = {:x}", ltk, handle);
-        self.write_bytes(
-            Command::LeLongTermKeyRequestReply { handle, ltk }
-                .encode()
-                .as_slice(),
-        ).await;
+        let cmd = HCIPacket::Command(CommandPacket::LeLongTermKeyRequestReply {
+            connection_handle: handle,
+            ltk
+        });
+        self.write_bytes(cmd.encode().as_slice()).await;
         trace!("done writing command");
         let res = self
-            .wait_for_command_complete(LE_OGF, LONG_TERM_KEY_REQUEST_REPLY_OCF).await?
-            .check_cmd_completed()?;
+            .wait_for_command_complete(LE_OGF, LONG_TERM_KEY_REQUEST_REPLY_OCF).await?;
         trace!("got completion event");
 
         Ok(res)
     }
 
-    pub async fn cmd_read_br_addr(&mut self) -> Result<[u8; 6], Error>
+    pub async fn cmd_read_br_addr(&mut self) -> Result<[u8; 6], BleError>
     where
         Self: Sized,
     {
-        self.write_bytes(Command::ReadBrAddr.encode().as_slice()).await;
+        let cmd = HCIPacket::Command(CommandPacket::ReadBdAddr {});
+        self.write_bytes(cmd.encode().as_slice()).await;
         let res = self
-            .wait_for_command_complete(INFORMATIONAL_OGF, READ_BD_ADDR_OCF).await?
-            .check_cmd_completed()?;
+            .wait_for_command_complete(INFORMATIONAL_OGF, READ_BD_ADDR_OCF).await?;
+
         match res {
             EventPacket::CommandComplete {
                 num_hci_command_packets: _,
@@ -264,11 +226,13 @@ where T: Read + Write,
                 return_parameters: data,
                 ..
             } => Ok(data.as_slice()[1..][..6].try_into().unwrap()),
-            _ => Err(Error::Failed(0)),
+            val => Err(BleError::Unknown(
+                format!("EventType is not Command Complete {:?}", val).as_str().try_into().unwrap()
+            )),
         }
     }
 
-    async fn wait_for_command_complete(&mut self, ogf: u8, ocf: u16) -> Result<EventPacket, Error>
+    async fn wait_for_command_complete(&mut self, ogf: u8, ocf: u16) -> Result<EventPacket, BleError>
     where
         Self: Sized,
     {
@@ -280,12 +244,29 @@ where T: Read + Write,
             }
 
             match res {
-                Some(PollResult::Event(event)) => match event {
+                Some(PollResult::Event(ref event)) => match event {
                     EventPacket::CommandComplete {
-                        command_opcode: code,
+                        command_opcode,
+                        return_parameters,
                         ..
-                    } if code == opcode(ogf, ocf) => {
-                        return Ok(event);
+                    } => {
+                        if command_opcode == &opcode(ogf, ocf) {
+                            let status = return_parameters[0];
+                            if status == 0 {
+                                return Ok(event.clone());
+                            }
+                            return match status.try_into() {
+                                Ok(e) => Err(BleError::CtrlErr(e)),
+                                Err(_) => Err(BleError::Unknown(
+                                    format!("Opcode({}) unknown Status({})", command_opcode, status)
+                                    .as_str().try_into().unwrap()
+                                )),
+                            };
+                        } else {
+                            return Err(BleError::Unknown(
+                                format!("unknown Opcode({})", command_opcode)
+                                .as_str().try_into().unwrap()));
+                        }
                     }
                     _ => (),
                 },
@@ -293,7 +274,7 @@ where T: Read + Write,
             }
 
             if self.millis() > timeout_at {
-                return Err(Error::Timeout);
+                return Err(BleError::Timeout);
             }
         }
     }

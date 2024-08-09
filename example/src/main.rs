@@ -93,7 +93,7 @@ fn main() {
                 if off < val.len() {
                     let len = data.len().min(val.len() - off);
                     data[..len].copy_from_slice(&val[off..off + len]);
-                    println!("SEND: Offset {}, data {:x?}", offset, &data[..len]);
+                    println!("SEND: Offset {}, data {:?}", offset, &data[..len]);
                     len
                 } else {
                     0
@@ -103,7 +103,7 @@ fn main() {
         let mut wf = {
             let val = val.clone();
             move |offset: usize, data: &[u8]| {
-                println!("RECEIVED: Offset {}, data {:x?}", offset, data);
+                println!("RECEIVED: Offset {}, data {:?}", offset, data);
                 let mut val = val.lock().unwrap();
                 let off = offset as usize;
                 if off < val.len() {
@@ -118,7 +118,7 @@ fn main() {
         };
 
         let mut wf2 = |offset: usize, data: &[u8]| {
-            println!("RECEIVED2: Offset {}, data {:x?}", offset, data);
+            println!("RECEIVED2: Offset {}, data {:?}", offset, data);
         };
 
         let mut rf3 = |_offset: usize, data: &mut [u8]| {
@@ -126,7 +126,7 @@ fn main() {
             5
         };
         let mut wf3 = |offset: usize, data: &[u8]| {
-            println!("RECEIVED3: Offset {}, data {:x?}", offset, data);
+            println!("RECEIVED3: Offset {}, data {:?}", offset, data);
         };
 
         gatt!([service {
@@ -218,7 +218,7 @@ fn main() {
                     }
                 }
                 Err(err) => {
-                    println!("{:x?}", err);
+                    println!("{:?}", err);
                 }
             }
         }

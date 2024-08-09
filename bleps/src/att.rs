@@ -25,6 +25,7 @@ const ATT_READ_BLOB_RESP_OPCODE: u8 = 0x0d;
 const ATT_HANDLE_VALUE_NTF_OPTCODE: u8 = 0x1b;
 
 #[derive(Debug, PartialEq, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Uuid {
     Uuid16(u16),
     Uuid128([u8; 16]),
@@ -93,6 +94,7 @@ impl From<&[u8]> for Uuid {
 }
 
 #[derive(Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum AttErrorCode {
     /// Attempted to use an `Handle` that isn't valid on this server.
     InvalidHandle = 0x01,
@@ -131,6 +133,7 @@ pub enum AttErrorCode {
 }
 
 #[derive(Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Att {
     ReadByGroupTypeReq {
         start: u16,
@@ -181,6 +184,7 @@ pub enum Att {
 }
 
 #[derive(Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum AttDecodeError {
     Other,
     UnknownOpcode(u8, Data),

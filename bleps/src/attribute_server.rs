@@ -1,6 +1,7 @@
+use heapless::Vec;
 use maybe_async::maybe_async;
 
-use crate::types::{ACLBoundaryFlag, ACLBroadcastFlag, ACLDataPacket, HCIPacket};
+use crate::types::{ACLBoundaryFlag, ACLBroadcastFlag, ACLDataPacket, CommandPacket, ControllerError, HCIPacket, Status};
 use crate::{trace, debug};
 use crate::{
     att::{
@@ -10,10 +11,10 @@ use crate::{
         ATT_READ_REQUEST_OPCODE, ATT_WRITE_REQUEST_OPCODE,
     },
     attribute::Attribute,
-    command::{Command, LE_OGF, SET_ADVERTISING_DATA_OCF},
+    command::{LE_OGF, SET_ADVERTISING_DATA_OCF},
     l2cap::{L2capDecodeError, L2capPacket},
     types::{EventPacket, LEEventPacket},
-    Ble, Data, Error,
+    Ble, Data, BleError,
     Read, Write
 };
 
@@ -88,7 +89,7 @@ impl<'a, T, F> AttributeServer<'a, T, F> {
             }
         }
 
-        trace!("{:#x?}", &attributes);
+        trace!("{:?}", &attributes);
 
         AttributeServer {
             ble,
@@ -121,27 +122,21 @@ impl<'a, T, F> AttributeServer<'a, T, F>
         }
     }
 
-    pub async fn update_le_advertising_data(&mut self, data: Data) -> Result<EventPacket, Error> {
+    pub async fn update_le_advertising_data(&mut self, data: Data) -> Result<EventPacket, BleError> {
+        let cmd = CommandPacket::LeSetAdvertisingData {
+            data: Vec::from_slice(data.as_slice()).unwrap()
+        };
         self.ble
-            .write_bytes(Command::LeSetAdvertisingData { data }.encode().as_slice())
+            .write_bytes(cmd.encode().as_slice())
             .await;
         self.ble
             .wait_for_command_complete(LE_OGF, SET_ADVERTISING_DATA_OCF)
-            .await?
-            .check_cmd_completed()
+            .await
     }
 
-    pub async fn disconnect(&mut self, reason: u8) -> Result<EventPacket, Error> {
-        self.ble
-            .write_bytes(
-                Command::Disconnect {
-                    connection_handle: 0,
-                    reason,
-                }
-                .encode()
-                .as_slice(),
-            )
-            .await;
+    pub async fn disconnect(&mut self, reason: Status) -> Result<EventPacket, BleError> {
+        let cmd = CommandPacket::Disconnect { connection_handle: 0, reason };
+        self.ble.write_bytes(cmd.encode().as_slice()).await;
         Ok(EventPacket::Unknown)
     }
 
@@ -203,7 +198,7 @@ impl<'a, T, F> AttributeServer<'a, T, F>
                         Ok(WorkResult::DidWork)
                     } else {
                     let packet = Att::decode(l2cap_packet)?;
-                    trace!("att: {:x?}", packet);
+                    trace!("att: {:?}", packet);
                     match packet {
                         Att::ReadByGroupTypeReq {
                             start,
@@ -303,9 +298,9 @@ impl<'a, T, F> AttributeServer<'a, T, F>
         let mut data = Data::new_att_read_by_group_type_response();
         let mut val = Err(AttErrorCode::AttributeNotFound);
         for att in self.attributes.iter_mut() {
-            trace!("Check attribute {:x?} {}", att.uuid, att.handle);
+            trace!("Check attribute {:?} {}", att.uuid, att.handle);
             if att.uuid == group_type && att.handle >= start && att.handle <= end {
-                debug!("found! {:x?}", att.handle);
+                debug!("found! {:?}", att.handle);
                 handle = att.handle;
                 val = att.value();
                 if let Ok(val) = val {
@@ -340,7 +335,7 @@ impl<'a, T, F> AttributeServer<'a, T, F>
         let mut data = Data::new_att_read_by_type_response();
         let mut err = Err(AttErrorCode::AttributeNotFound);
         for att in self.attributes.iter_mut() {
-            trace!("Check attribute {:x?} {}", att.uuid, att.handle);
+            trace!("Check attribute {:?} {}", att.uuid, att.handle);
             if att.uuid == attribute_type && att.handle >= start && att.handle <= end {
                 data.append_value(att.handle);
                 handle = att.handle;
@@ -353,7 +348,7 @@ impl<'a, T, F> AttributeServer<'a, T, F>
                     }
                 }
 
-                debug!("found! {:x?} {}", att.uuid, att.handle);
+                debug!("found! {:?} {}", att.uuid, att.handle);
                 break;
             }
         }
@@ -402,7 +397,7 @@ impl<'a, T, F> AttributeServer<'a, T, F>
 
         let err = att.data.write(0, data.as_slice());
         if let Err(e) = err {
-            debug!("write error: {e:?}");
+            debug!("write error: {:?}", e);
             return Err(e);
         }
 
@@ -435,7 +430,7 @@ impl<'a, T, F> AttributeServer<'a, T, F>
 
     async fn handle_exchange_mtu(&mut self, src_handle: u16, mtu: u16) {
         self.mtu = mtu.min(MTU);
-        debug!("Requested MTU {mtu}, returning {}", self.mtu);
+        debug!("Requested MTU {}, returning {}", mtu, self.mtu);
         self.write_att(src_handle, Data::new_att_exchange_mtu_response(self.mtu))
             .await;
     }
@@ -466,12 +461,12 @@ impl<'a, T, F> AttributeServer<'a, T, F>
         let mut data = Data::new_att_find_information_response();
 
         for att in self.attributes.iter_mut() {
-            trace!("Check attribute {:x?} {}", att.uuid, att.handle);
+            trace!("Check attribute {:?} {}", att.uuid, att.handle);
             if att.handle >= start && att.handle <= end {
                 if !data.append_att_find_information_response(att.handle, &att.uuid) {
                     break;
                 }
-                debug!("found! {:x?} {}", att.uuid, att.handle);
+                debug!("found! {:?} {}", att.uuid, att.handle);
             }
         }
 
@@ -557,10 +552,10 @@ impl<'a, T, F> AttributeServer<'a, T, F>
 
     async fn write_att(&mut self, handle: u16, data: Data) {
         debug!("src_handle {}", handle);
-        debug!("data {:x?}", data.as_slice());
+        debug!("data {:?}", data.as_slice());
 
         let res = L2capPacket::encode(data);
-        trace!("encoded_l2cap {:x?}", res.as_slice());
+        trace!("encoded_l2cap {:?}", res.as_slice());
 
         let pkt = ACLDataPacket::new(
             handle,
@@ -571,7 +566,7 @@ impl<'a, T, F> AttributeServer<'a, T, F>
 
         let pkt = HCIPacket::ACLData(pkt);
         let buffer = pkt.encode();
-        trace!("writing {:x?}", buffer.as_slice());
+        trace!("writing {:?}", buffer.as_slice());
         self.ble.write_bytes(&buffer).await;
     }
 }

@@ -19,7 +19,7 @@ fn test() {
         },],
     },]);
 
-    println!("{:x?}", gatt_attributes);
+    println!("{:?}", gatt_attributes);
 }
 
 #[test]
@@ -41,7 +41,7 @@ fn test2() {
         },],
     },]);
 
-    println!("{:x?}", gatt_attributes);
+    println!("{:?}", gatt_attributes);
 }
 
 #[test]
@@ -64,7 +64,7 @@ fn test3() {
         },],
     },]);
 
-    println!("{:x?}", gatt_attributes);
+    println!("{:?}", gatt_attributes);
 }
 
 #[test]
@@ -89,7 +89,7 @@ fn test4() {
         },],
     },]);
 
-    println!("{:x?}", gatt_attributes);
+    println!("{:?}", gatt_attributes);
 
     println!("{}", my_characteristic_handle);
     println!("{}", my_characteristic_notify_enable_handle);
@@ -128,7 +128,7 @@ fn test5() {
         },],
     },]);
 
-    println!("{:x?}", gatt_attributes);
+    println!("{:?}", gatt_attributes);
 }
 
 #[test]
@@ -155,5 +155,5 @@ fn test6() {
         },],
     },]);
 
-    println!("{:x?}", gatt_attributes);
+    println!("{:?}", gatt_attributes);
 }
