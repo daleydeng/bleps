@@ -25,12 +25,10 @@ use command::{
 use command::{CONTROLLER_OGF, LE_OGF, RESET_OCF, SET_ADVERTISING_PARAMETERS_OCF};
 pub use types::{Data, EventPacket};
 
-pub mod acl;
 pub mod ad_structure;
 pub mod att;
 pub mod buffer;
 pub mod command;
-pub mod event;
 pub mod l2cap;
 
 pub mod types;

@@ -1,5 +1,6 @@
 use heapless::Vec;
-use binrw::{binrw, io::{Cursor, Read, Seek}, meta::WriteEndian, BinRead, BinResult, BinWrite, Endian};
+use binrw::{binrw, io::Cursor, meta::WriteEndian, BinRead, BinResult, BinWrite, Endian};
+use maybe_async::maybe_async;
 use crate::debug;
 use modular_bitfield::{bitfield, prelude::*};
 use thiserror_no_std::Error;
@@ -250,7 +251,7 @@ pub enum CentralClockAccuracy {
     PPM20 = 0x07,
 }
 
-fn parse_vec<R: Read + Seek, const N: usize>(count: usize, reader: &mut R, endian: Endian) -> BinResult<Vec<u8, N>> {
+fn parse_vec<R: binrw::io::Read + binrw::io::Seek, const N: usize>(count: usize, reader: &mut R, endian: Endian) -> BinResult<Vec<u8, N>> {
     let mut ret = Vec::new();
     for _ in 0..count {
         ret.push(<_>::read_options(reader, endian, ())?).unwrap();
@@ -368,6 +369,21 @@ pub enum LEEventPacket {
     },
 }
 
+impl EventPacket {
+    #[maybe_async]
+    pub async fn read<T: crate::Read>(connector: &mut T) -> Self {
+        let mut buffer = [0u8; EVT_PKT_PAYLOAD_MAX_SIZE];
+        let l = connector.read(&mut buffer[..2]).await.unwrap();
+        assert_eq!(l, 2);
+        let len = buffer[1] as usize;
+
+        let l = connector.read(&mut buffer[2..len+2]).await.unwrap();
+        assert_eq!(l, len);
+
+        <Self as BinRead>::read(&mut Cursor::new(&buffer[..len+2])).unwrap()
+    }
+}
+
 #[binrw::parser(reader, endian)]
 fn parse_acl_payload(count: u16) -> BinResult<ACLDataPayloadBuffer> {
     parse_vec(count as usize, reader, endian)
@@ -386,8 +402,32 @@ pub struct ACLDataPacket {
 }
 
 impl ACLDataPacket {
+    pub fn new(handle: u16, pb: ACLBoundaryFlag, bc: ACLBroadcastFlag, payload: &[u8]) -> Self {
+        Self {
+            header: ACLDataPacketHeader::new()
+                .with_handle(handle)
+                .with_packet_boundary_flag(pb)
+                .with_broadcast_flag(bc),
+            len: payload.len() as u16,
+            data: ACLDataPayloadBuffer::from_slice(payload).unwrap(),
+        }
+    }
+
     pub fn encode(&self) -> ACLDataPacketBuffer {
         encode(self)
+    }
+
+    #[maybe_async]
+    pub async fn read<T: crate::Read>(connector: &mut T) -> Self {
+        let mut buffer = [0u8; ACL_PKT_MAX_SIZE];
+        let l = connector.read(&mut buffer[..4]).await.unwrap();
+        assert_eq!(l, ACL_PKT_HEADER_SIZE);
+        let len = u16::from_le_bytes(buffer[2..4].try_into().unwrap()) as usize;
+        assert!(len <= 27);
+        let tot_len = len + 4;
+        let l = connector.read(&mut buffer[4..tot_len]).await.unwrap();
+        assert_eq!(l, len);
+        <Self as BinRead>::read(&mut Cursor::new(&buffer[..tot_len])).unwrap()
     }
 }
 
