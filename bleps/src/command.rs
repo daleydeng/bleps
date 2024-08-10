@@ -1,7 +1,7 @@
 use binrw::{io::Cursor, BinWrite};
 use heapless::Vec;
 
-use crate::{debug, types::{CommandPacket, CMD_PKT_MAX_SIZE}, Data};
+use crate::{debug, hci::{CommandPacket, CMD_PKT_MAX_SIZE}, Data};
 
 pub const CONTROLLER_OGF: u8 = 0x03;
 pub const RESET_OCF: u16 = 0x03;
@@ -26,9 +26,7 @@ pub const READ_BD_ADDR_OCF: u16 = 0x09;
 //     pub len: u8,
 // }
 
-pub const fn opcode(ogf: u8, ocf: u16) -> u16 {
-    ((ogf as u16) << 10) + ocf as u16
-}
+
 
 // impl CommandHeader {
 //     pub fn from_bytes(bytes: &[u8]) -> CommandHeader {

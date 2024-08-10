@@ -1,7 +1,8 @@
+use fixedstr::str_format;
 use heapless::Vec;
 use binrw::{binrw, io::Cursor, meta::WriteEndian, BinRead, BinResult, BinWrite, Endian};
 use maybe_async::maybe_async;
-use crate::debug;
+use crate::{debug, Ble, BleError, MsgStr, MsgType};
 use modular_bitfield::{bitfield, prelude::*};
 use thiserror_no_std::Error;
 use num_enum::{TryFromPrimitive, IntoPrimitive};
@@ -28,7 +29,6 @@ impl core::fmt::Debug for Data {
         Ok(())
     }
 }
-
 
 pub const EVT_PKT_HEADER_SIZE: usize = 2;
 pub const EVT_PKT_PAYLOAD_MAX_SIZE: usize = 255;
@@ -212,8 +212,8 @@ pub enum ControllerError {
 #[derive(BinRead, BinWrite, PartialEq, Clone, Copy, Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[brw(little)]
-#[br(map = |x: u8| if x == 0 { Status::Ok } else {Status::Err(ControllerError::try_from(x).unwrap())})]
-#[bw(map = |&x| if let Status::Err(x) = x {x.into()} else {0u8})]
+#[br(map = |x: u8| x.try_into().unwrap())]
+#[bw(map = |x: &Status| Into::<u8>::into(*x))]
 pub enum Status{
     Ok,
     Err(ControllerError),
@@ -225,6 +225,29 @@ impl From<Status> for Result<u8, ControllerError> {
             Err(x)
         } else {
             Ok(0u8)
+        }
+    }
+}
+
+impl TryFrom<u8> for Status {
+    type Error = BleError;
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        if value == 0 {
+            Ok(Status::Ok)
+        } else {
+            let e = value.try_into().map_err(|_| BleError::InvalidParameter(MsgType(
+                str_format!(MsgStr, "from u8({}) to Status invalid!", value)
+            )))?;
+            Ok(Status::Err(e))
+        }
+    }
+}
+
+impl From<Status> for u8 {
+    fn from(value: Status) -> Self {
+        match value {
+            Status::Ok => 0,
+            Status::Err(e) => e.into()
         }
     }
 }
@@ -259,6 +282,14 @@ fn parse_vec<R: binrw::io::Read + binrw::io::Seek, const N: usize>(count: usize,
     Ok(ret)
 }
 
+pub mod hcicode {
+    pub const COMMAND: u8 = 0x01;
+    pub const ACL_DATA: u8 = 0x02;
+    pub const SYNC_DATA: u8 = 0x03;
+    pub const EVENT: u8 = 0x04;
+    pub const ISO_DATA: u8 = 0x05;
+}
+
 #[derive(BinRead, BinWrite, Debug, PartialEq, Clone)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[brw(little)]
@@ -289,6 +320,43 @@ impl HCIPacket {
     pub fn encode(&self) -> HCIPacketBuffer {
         encode(self)
     }
+
+    pub fn opcode(&self) -> Result<u16, BleError> {
+        match self {
+            HCIPacket::Command(cmd) => Ok(cmd.opcode()),
+            _ => Err(BleError::PacketFormatError),
+        }
+    }
+
+    #[maybe_async]
+    pub async fn read<T: crate::Read>(connector: &mut T) -> Result<Option<Self>, BleError> {
+        let mut buffer = [0u8;1];
+        let l = connector.read(&mut buffer).await.map_err(|_|{BleError::IOError})?;
+        if l == 0 {
+            return Ok(None);
+        }
+
+        if l != 1 {
+            return Err(BleError::IOError);
+        }
+
+        let typ = buffer[0];
+
+        Ok(Some(match typ {
+            hcicode::COMMAND => {
+                Self::Command(CommandPacket::read(connector).await)
+            },
+            hcicode::EVENT => {
+                Self::Event(EventPacket::read(connector).await)
+            },
+            hcicode::ACL_DATA => {
+                Self::ACLData(ACLDataPacket::read(connector).await)
+            }
+            _ => {
+                panic!("HCI type invalid {}", typ);
+            },
+        }))
+    }
 }
 
 #[binrw::parser(reader, endian)]
@@ -302,6 +370,7 @@ fn parse_vec_event_command_complete(count: u8) -> BinResult<EvtPayloadBufferComm
 pub enum EventPacket {
     #[br(magic = 0x05u8)]
     DisconnectionComplete {
+        #[br(assert(len == 4, "size error, {}", len))]
         len: u8,
         status: Status,
         connection_handle: u16,
@@ -309,6 +378,7 @@ pub enum EventPacket {
     },
     #[br(magic = 0x0eu8)]
     CommandComplete {
+        #[br(assert(len > 3, "size error, {}", len))]
         len: u8,
         num_hci_command_packets: u8,
         command_opcode: u16,
@@ -318,6 +388,7 @@ pub enum EventPacket {
     },
     #[br(magic = 0x13u8)]
     NumberOfCompletedPackets {
+        #[br(assert(len == 5, "size error, {}", len))]
         len: u8,
         num_handles: u8,
         connection_handle_i: u16,     // should be list
@@ -372,15 +443,16 @@ pub enum LEEventPacket {
 impl EventPacket {
     #[maybe_async]
     pub async fn read<T: crate::Read>(connector: &mut T) -> Self {
-        let mut buffer = [0u8; EVT_PKT_PAYLOAD_MAX_SIZE];
-        let l = connector.read(&mut buffer[..2]).await.unwrap();
-        assert_eq!(l, 2);
+        let mut buffer = [0u8; EVT_PKT_MAX_SIZE];
+        let l = connector.read(&mut buffer[..EVT_PKT_HEADER_SIZE]).await.unwrap();
+        assert_eq!(l, EVT_PKT_HEADER_SIZE);
         let len = buffer[1] as usize;
+        let tot_len = len + EVT_PKT_HEADER_SIZE;
 
-        let l = connector.read(&mut buffer[2..len+2]).await.unwrap();
+        let l = connector.read(&mut buffer[EVT_PKT_HEADER_SIZE..tot_len]).await.unwrap();
         assert_eq!(l, len);
 
-        <Self as BinRead>::read(&mut Cursor::new(&buffer[..len+2])).unwrap()
+        <Self as BinRead>::read(&mut Cursor::new(&buffer[..tot_len])).unwrap()
     }
 }
 
@@ -399,6 +471,17 @@ pub struct ACLDataPacket {
     #[br(parse_with = parse_acl_payload, args(len))]
     #[bw(map = |x| x.as_slice())]
     pub data: ACLDataPayloadBuffer,
+}
+
+#[bitfield]
+#[derive(BinRead, BinWrite, PartialEq, Clone, Copy, Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[br(map = Self::from_bytes)]
+#[bw(map = |&x| Self::into_bytes(x))]
+pub struct ACLDataPacketHeader {
+    pub handle: B12,
+    pub packet_boundary_flag: ACLBoundaryFlag,
+    pub broadcast_flag: ACLBroadcastFlag,
 }
 
 impl ACLDataPacket {
@@ -420,26 +503,15 @@ impl ACLDataPacket {
     #[maybe_async]
     pub async fn read<T: crate::Read>(connector: &mut T) -> Self {
         let mut buffer = [0u8; ACL_PKT_MAX_SIZE];
-        let l = connector.read(&mut buffer[..4]).await.unwrap();
+        let l = connector.read(&mut buffer[..ACL_PKT_HEADER_SIZE]).await.unwrap();
         assert_eq!(l, ACL_PKT_HEADER_SIZE);
-        let len = u16::from_le_bytes(buffer[2..4].try_into().unwrap()) as usize;
+        let len = u16::from_le_bytes(buffer[2..ACL_PKT_HEADER_SIZE].try_into().unwrap()) as usize;
         assert!(len <= 27);
-        let tot_len = len + 4;
-        let l = connector.read(&mut buffer[4..tot_len]).await.unwrap();
+        let tot_len = len + ACL_PKT_HEADER_SIZE;
+        let l = connector.read(&mut buffer[ACL_PKT_HEADER_SIZE..tot_len]).await.unwrap();
         assert_eq!(l, len);
         <Self as BinRead>::read(&mut Cursor::new(&buffer[..tot_len])).unwrap()
     }
-}
-
-#[bitfield]
-#[derive(BinRead, BinWrite, PartialEq, Clone, Copy, Debug)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-#[br(map = Self::from_bytes)]
-#[bw(map = |&x| Self::into_bytes(x))]
-pub struct ACLDataPacketHeader {
-    pub handle: B12,
-    pub packet_boundary_flag: ACLBoundaryFlag,
-    pub broadcast_flag: ACLBroadcastFlag,
 }
 
 #[derive(BitfieldSpecifier, Clone, Copy, PartialEq, Debug)]
@@ -471,28 +543,56 @@ fn parse_le_scan_rsp_data(data_len: u8) -> BinResult<CmdLeScanRspDataBuffer> {
     parse_vec(data_len as usize, reader, endian)
 }
 
+// pub const fn opcode(ogf: u8, ocf: u16) -> u16 {
+//     ((ogf as u16) << 10) + ocf as u16
+// }
+
+pub mod opcodes {
+    pub const RESET: u16 = 0x0c03;
+    pub const LE_SET_ADVERTISING_PARAMETERS: u16 = 0x2006;
+    pub const LE_SET_ADVERTISING_DATA: u16 = 0x2008;
+    pub const LE_SET_SCAN_RSP_DATA: u16 = 0x2009;
+    pub const LE_SET_ADVERTISE_ENABLE: u16 = 0x200a;
+    pub const LE_LONG_TERM_KEY_REQUEST_REPLY: u16 = 0x201a;
+    pub const LE_SET_EVENT_MASK: u16 = 0x2001;
+    pub const SET_EVENT_MASK: u16 = 0x0c01;
+    pub const DISCONNECT: u16 = 0x0406;
+    pub const READ_BD_ADDR: u16 = 0x1009;
+}
+
 #[binrw]
 #[brw(little)]
 #[derive(PartialEq, Clone, Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum CommandPacket {
-    #[brw(magic = 0x0c03u16)] // 0x3 << 10 + 0x3
     Reset {
+        #[bw(calc(opcodes::RESET))]
+        #[br(assert(opcode == opcodes::RESET))]
+        opcode: u16,
+
         #[bw(calc(0u8))]
         #[br(assert(len == 0, "len({}) != 0", len))]
         len: u8,
     },
-    #[brw(magic = 0x2006u16)]
+
     LeSetAdvertisingParameters {
+        #[bw(calc(opcodes::LE_SET_ADVERTISING_PARAMETERS))]
+        #[br(assert(opcode == opcodes::LE_SET_ADVERTISING_PARAMETERS))]
+        opcode: u16,
+
         #[bw(calc(15u8))]
         #[br(assert(len == 15, "len({}) != 15", len))]
         len: u8,
         params: AdvertisingParameters,
     },
-    #[brw(magic = 0x2008u16)]
+
     #[br(assert(len == data.len() as u8 + 1, "len({}) != {}", len, data.len() as u8 + 1))]
     #[br(assert(data_len == data.len() as u8, "len({}) != {}", len, data.len() as u8))]
     LeSetAdvertisingData {
+        #[bw(calc(opcodes::LE_SET_ADVERTISING_DATA))]
+        #[br(assert(opcode == opcodes::LE_SET_ADVERTISING_DATA))]
+        opcode: u16,
+
         #[bw(calc((data.len() + 1) as u8))]
         len: u8,
         #[bw(calc(data.len() as u8))]
@@ -501,10 +601,14 @@ pub enum CommandPacket {
         #[bw(map = |x| x.as_slice())]
         data: CmdLeAdvDataBuffer,
     },
-    #[brw(magic = 0x2009u16)]
+
     #[br(assert(len == data.len() as u8 + 1, "len({}) != {}", len, data.len() as u8 + 1))]
     #[br(assert(data_len == data.len() as u8, "len({}) != {}", len, data.len() as u8))]
     LeSetScanRspData {
+        #[bw(calc(opcodes::LE_SET_SCAN_RSP_DATA))]
+        #[br(assert(opcode == opcodes::LE_SET_SCAN_RSP_DATA))]
+        opcode: u16,
+
         #[bw(calc((data.len() + 1) as u8))]
         len: u8,
         #[bw(calc(data.len() as u8))]
@@ -513,47 +617,71 @@ pub enum CommandPacket {
         #[bw(map = |x| x.as_slice())]
         data: CmdLeScanRspDataBuffer,
     },
-    #[brw(magic = 0x200au16)]
+
     LeSetAdvertiseEnable{
+        #[bw(calc(opcodes::LE_SET_ADVERTISE_ENABLE))]
+        #[br(assert(opcode == opcodes::LE_SET_ADVERTISE_ENABLE))]
+        opcode: u16,
+
         #[bw(calc(1u8))]
         #[br(assert(len == 1, "len({}) != 1", len))]
         len: u8,
         #[br(map = |x: u8| x == 0x01)] // us V.4 P.E 7.8.5
-        #[bw(map = |x: &bool| if *x {0x01} else {0x00})]
+        #[bw(map = |x: &bool| if *x {0x01u8} else {0x00u8})]
         enable: bool,
     },
-    #[brw(magic = 0x201au16)]
+
     LeLongTermKeyRequestReply {
+        #[bw(calc(opcodes::LE_LONG_TERM_KEY_REQUEST_REPLY))]
+        #[br(assert(opcode == opcodes::LE_LONG_TERM_KEY_REQUEST_REPLY))]
+        opcode: u16,
+
         #[bw(calc(18u8))]
         #[br(assert(len == 18, "len({}) != 18", len))]
         len: u8,
         connection_handle: u16,
         ltk: u128
     },
-    #[brw(magic = 0x2001u16)]
+
     LeSetEventMask {
+        #[bw(calc(opcodes::LE_SET_EVENT_MASK))]
+        #[br(assert(opcode == opcodes::LE_SET_EVENT_MASK))]
+        opcode: u16,
+
         #[bw(calc(8u8))]
         #[br(assert(len == 8, "len({}) != 8", len))]
         len: u8,
         event_mask: u64
     },
-    #[brw(magic = 0x0c01u16)]
+
     SetEventMask {
+        #[bw(calc(opcodes::SET_EVENT_MASK))]
+        #[br(assert(opcode == opcodes::SET_EVENT_MASK))]
+        opcode: u16,
+
         #[bw(calc(8u8))]
         #[br(assert(len == 8, "len({}) != 8", len))]
         len: u8,
         event_mask: u64
     },
-    #[brw(magic = 0x0406u16)]
+
     Disconnect {
+        #[bw(calc(opcodes::DISCONNECT))]
+        #[br(assert(opcode == opcodes::DISCONNECT))]
+        opcode: u16,
+
         #[bw(calc(3u8))]
         #[br(assert(len == 3, "len({}) != 3", len))]
         len: u8,
         connection_handle: u16,
         reason: Status,
     },
-    #[brw(magic = 0x1009u16)]
+
     ReadBdAddr {
+        #[bw(calc(opcodes::READ_BD_ADDR))]
+        #[br(assert(opcode == opcodes::READ_BD_ADDR, "opcode error {}", opcode))]
+        opcode: u16,
+
         #[bw(calc(0u8))]
         #[br(assert(len == 0, "len({}) != 0", len))]
         len: u8,
@@ -596,6 +724,34 @@ impl Default for AdvertisingParameters {
 impl CommandPacket {
     pub fn encode(&self) -> CommandPacketBuffer {
         encode(self)
+    }
+
+    pub fn opcode(&self) -> u16 {
+        use CommandPacket::*;
+        match self {
+            Reset {..} => opcodes::RESET,
+            LeSetAdvertisingParameters{..} => opcodes::LE_SET_ADVERTISING_PARAMETERS,
+            LeSetAdvertisingData{..} => opcodes::LE_SET_ADVERTISING_DATA,
+            LeSetScanRspData{..} => opcodes::LE_SET_SCAN_RSP_DATA,
+            LeSetAdvertiseEnable{..} => opcodes::LE_SET_ADVERTISE_ENABLE,
+            LeLongTermKeyRequestReply{..} => opcodes::LE_LONG_TERM_KEY_REQUEST_REPLY,
+            LeSetEventMask{..} => opcodes::LE_SET_EVENT_MASK,
+            SetEventMask{..} => opcodes::SET_EVENT_MASK,
+            Disconnect{..} => opcodes::DISCONNECT,
+            ReadBdAddr{..} => opcodes::READ_BD_ADDR,
+        }
+    }
+
+    #[maybe_async]
+    pub async fn read<T: crate::Read>(connector: &mut T) -> Self {
+        let mut buffer = [0u8; CMD_PKT_MAX_SIZE];
+        let l = connector.read(&mut buffer[..CMD_PKT_HEADER_SIZE]).await.unwrap();
+        assert_eq!(l, CMD_PKT_HEADER_SIZE);
+        let len = buffer[2] as usize;
+        let tot_len = len + CMD_PKT_HEADER_SIZE;
+        let l = connector.read(&mut buffer[CMD_PKT_HEADER_SIZE..tot_len]).await.unwrap();
+        assert_eq!(l, len);
+        <Self as BinRead>::read(&mut Cursor::new(&buffer[..tot_len])).unwrap()
     }
 }
 

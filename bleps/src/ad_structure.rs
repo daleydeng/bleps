@@ -1,15 +1,12 @@
-use crate::{att::Uuid, Data};
+use fixedstr::str_format;
+
+use crate::{att::Uuid, BleError, Data, MsgStr, MsgType};
 
 pub const AD_FLAG_LE_LIMITED_DISCOVERABLE: u8 = 0b00000001;
 pub const LE_GENERAL_DISCOVERABLE: u8 = 0b00000010;
 pub const BR_EDR_NOT_SUPPORTED: u8 = 0b00000100;
 pub const SIMUL_LE_BR_CONTROLLER: u8 = 0b00001000;
 pub const SIMUL_LE_BR_HOST: u8 = 0b00010000;
-
-#[derive(Debug, Copy, Clone)]
-pub enum AdvertisementDataError {
-    TooLong,
-}
 
 #[derive(Debug, Copy, Clone)]
 pub enum AdStructure<'a> {
@@ -102,10 +99,20 @@ impl Data {
     }
 }
 
-pub fn create_advertising_data(ad: &[AdStructure]) -> Result<Data, AdvertisementDataError> {
+pub fn create_advertising_data(ad: &[AdStructure]) -> Result<Data, BleError> {
     let mut data = Data::default();
     for item in ad.iter() {
         data.append_ad_structure(&item);
     }
+
+    if data.len() > 31 {
+        return Err(BleError::InvalidParameter(MsgType(
+            str_format!(MsgStr, "Advertising data too long {}! > 31", data.len())
+        )));
+    }
+    for _ in 0..31 - data.len() {
+        data.append(&[0u8])
+    }
+    assert_eq!(data.len(), 31);
     Ok(data)
 }

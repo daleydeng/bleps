@@ -1,4 +1,5 @@
 #![feature(assert_matches)]
+
 #[cfg(feature = "sync")]
 mod test {
 
@@ -7,8 +8,7 @@ use std::assert_matches::assert_matches;
 use std::process::Command;
 extern crate std;
 
-use bleps::ad_structure::AdvertisementDataError;
-use bleps::types::{ACLBoundaryFlag, ACLBroadcastFlag, ACLDataPacket, ACLDataPacketHeader, AdvertisingParameters, CommandPacket, EventPacket, HCIPacket, LEEventPacket, PeerAddressType, Status};
+use bleps::hci::{ACLBoundaryFlag, ACLBroadcastFlag, ACLDataPacket, ACLDataPacketHeader, AdvertisingParameters, CommandPacket, EventPacket, HCIPacket, LEEventPacket, PeerAddressType, Status};
 use bleps::BleError;
 use bleps::{
     ad_structure::{
@@ -18,7 +18,7 @@ use bleps::{
     attribute::Attribute,
     attribute_server::{AttributeServer, CHARACTERISTIC_UUID16, PRIMARY_SERVICE_UUID16},
     l2cap::L2capPacket,
-    types::{Data, ControllerError, Role, CentralClockAccuracy},
+    hci::{Data, ControllerError, Role, CentralClockAccuracy},
     Ble, PollResult,
     Read, Write,
 };
@@ -328,6 +328,7 @@ fn init_fails_timeout() {
     let get_millis = || timer.millis();
 
     let mut connector = TestConnector::default();
+    // connector.provide_data_to_read(&[0x00; 10]);
     let mut ble = Ble::new(&mut connector, get_millis);
 
     let res = ble.init();
@@ -388,22 +389,21 @@ fn create_le_set_advertising_parameters_works() {
     );
 }
 
-// #[test]
-// fn create_le_set_advertising_data_works() {
-//     let data = Command::LeSetAdvertisingData {
-//         data: Data::new(&[1, 2, 3, 4, 5]),
-//     }
-//     .encode();
-//     assert_eq!(data.len, 9);
-//     assert_eq!(data.data[..9], [0x01, 0x08, 0x20, 0x05, 1, 2, 3, 4, 5]);
-// }
+#[test]
+fn create_le_set_advertising_data_works() {
+    let cmd = HCIPacket::Command(CommandPacket::LeSetAdvertisingData {
+        data: heapless::Vec::from_slice(&[1, 2, 3, 4, 5]).unwrap()
+    });
+    assert_eq!(cmd.encode(), [0x01, 0x08, 0x20, 0x06, 0x05, 1, 2, 3, 4, 5]);
+}
 
-// #[test]
-// fn create_le_set_advertise_enable_works() {
-//     let data = Command::LeSetAdvertiseEnable(true).encode();
-//     assert_eq!(data.len, 5);
-//     assert_eq!(data.data[..5], [0x01, 0x0a, 0x20, 0x01, 0x01]);
-// }
+#[test]
+fn create_le_set_advertise_enable_works() {
+    let cmd = HCIPacket::Command(CommandPacket::LeSetAdvertiseEnable {
+        enable: true,
+    });
+    assert_eq!(cmd.encode(), [0x01, 0x0a, 0x20, 0x01, 0x01]);
+}
 
 #[test]
 fn set_advertising_parameters_works() {
@@ -696,38 +696,38 @@ fn create_write_resp_works() {
     assert_matches!(res.as_slice(), &[0x13]);
 }
 
-// #[test]
-// fn create_advertising_data_works() {
-//     let res = create_advertising_data(&[
-//         AdStructure::Flags(LE_GENERAL_DISCOVERABLE | BR_EDR_NOT_SUPPORTED),
-//         AdStructure::ServiceUuids16(&[Uuid::Uuid16(0x1809)]),
-//         AdStructure::CompleteLocalName("Ble-Example!"),
-//     ])
-//     .unwrap();
+#[test]
+fn create_advertising_data_works() {
+    let res = create_advertising_data(&[
+        AdStructure::Flags(LE_GENERAL_DISCOVERABLE | BR_EDR_NOT_SUPPORTED),
+        AdStructure::ServiceUuids16(&[Uuid::Uuid16(0x1809)]),
+        AdStructure::CompleteLocalName("Ble-Example!"),
+    ])
+    .unwrap();
 
-//     println!("{:?}", res);
+    println!("{:?}", res);
 
-//     assert_matches!(
-//         res.as_slice(),
-//         &[
-//             21, 2, 1, 6, 3, 2, 9, 24, 13, 9, 66, 108, 101, 45, 69, 120, 97, 109, 112, 108, 101, 33,
-//             0, 0, 0, 0, 0, 0, 0, 0, 0, 0
-//         ]
-//     );
-// }
+    assert_matches!(
+        res.as_slice(),
+        [
+            2, 1, 6, 3, 2, 9, 24, 13, 9, 66, 108, 101, 45, 69, 120, 97, 109, 112, 108, 101, 33,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        ]
+    );
+}
 
-// #[test]
-// fn create_advertising_data_fails() {
-//     let res = create_advertising_data(&[
-//         AdStructure::Flags(LE_GENERAL_DISCOVERABLE | BR_EDR_NOT_SUPPORTED),
-//         AdStructure::ServiceUuids16(&[Uuid::Uuid16(0x1809)]),
-//         AdStructure::CompleteLocalName(
-//             "Ble-Example!Ble-Example!Ble-Example!Ble-Example!Ble-Example!Ble-Example!Ble-Example!",
-//         ),
-//     ]);
+#[test]
+fn create_advertising_data_fails() {
+    let res = create_advertising_data(&[
+        AdStructure::Flags(LE_GENERAL_DISCOVERABLE | BR_EDR_NOT_SUPPORTED),
+        AdStructure::ServiceUuids16(&[Uuid::Uuid16(0x1809)]),
+        AdStructure::CompleteLocalName(
+            "Ble-Example!Ble-Example!Ble-Example!Ble-Example!Ble-Example!Ble-Example!Ble-Example!",
+        ),
+    ]);
 
-//     assert_matches!(res, Err(AdvertisementDataError::TooLong));
-// }
+    assert_matches!(res, Err(BleError::InvalidParameter(_)));
+}
 
 #[test]
 fn attribute_server_discover_two_services() {

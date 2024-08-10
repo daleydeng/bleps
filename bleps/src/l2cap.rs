@@ -1,4 +1,4 @@
-use crate::{debug, types::ACLDataPacket, Data};
+use crate::{debug, hci::ACLDataPacket, Data};
 
 #[derive(Debug)]
 pub struct L2capPacket {

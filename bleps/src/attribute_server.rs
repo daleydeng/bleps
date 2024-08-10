@@ -1,7 +1,8 @@
 use heapless::Vec;
 use maybe_async::maybe_async;
 
-use crate::types::{ACLBoundaryFlag, ACLBroadcastFlag, ACLDataPacket, CommandPacket, ControllerError, HCIPacket, Status};
+use crate::hci::opcodes::LE_SET_ADVERTISING_DATA;
+use crate::hci::{ACLBoundaryFlag, ACLBroadcastFlag, ACLDataPacket, CommandPacket, ControllerError, HCIPacket, Status};
 use crate::{trace, debug};
 use crate::{
     att::{
@@ -13,7 +14,7 @@ use crate::{
     attribute::Attribute,
     command::{LE_OGF, SET_ADVERTISING_DATA_OCF},
     l2cap::{L2capDecodeError, L2capPacket},
-    types::{EventPacket, LEEventPacket},
+    hci::{EventPacket, LEEventPacket},
     Ble, Data, BleError,
     Read, Write
 };
@@ -126,12 +127,8 @@ impl<'a, T, F> AttributeServer<'a, T, F>
         let cmd = CommandPacket::LeSetAdvertisingData {
             data: Vec::from_slice(data.as_slice()).unwrap()
         };
-        self.ble
-            .write_bytes(cmd.encode().as_slice())
-            .await;
-        self.ble
-            .wait_for_command_complete(LE_OGF, SET_ADVERTISING_DATA_OCF)
-            .await
+        self.ble.write_bytes(cmd.encode().as_slice()).await;
+        self.ble.wait_for_command_complete(LE_SET_ADVERTISING_DATA).await
     }
 
     pub async fn disconnect(&mut self, reason: Status) -> Result<EventPacket, BleError> {
